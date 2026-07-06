@@ -993,7 +993,6 @@ export class MetadataService extends BaseService {
     const result = firstDateTime(exifTags);
     const tag = result?.tag;
     const dateTime = result?.dateTime;
-
     if (dateTime) {
       this.logger.verbose(
         `Date and time is ${dateTime} using exifTag ${tag} for asset ${asset.id}: ${asset.originalPath}`,
@@ -1004,7 +1003,6 @@ export class MetadataService extends BaseService {
 
     // timezone
     let timeZone = exifTags.zone ?? null;
-
     if (timeZone == null && (dateTime?.rawValue?.endsWith('Z') || dateTime?.rawValue?.endsWith('+00:00'))) {
       // exiftool-vendored returns "no timezone" information even though "+00:00" might be set explicitly
       // https://github.com/photostructure/exiftool-vendored.js/issues/203
@@ -1020,34 +1018,17 @@ export class MetadataService extends BaseService {
     }
 
     let dateTimeOriginal = dateTime?.toDateTime();
-    let localDateTime: DateTime | undefined;
 
-    /*
-    * Source metadata has a date/time but no explicit timezone:
-    * preserve the raw wall-clock time exactly as written in the file.
-    *
-    * Example:
-    *   source: 2026-07-06 09:31:16, timezone: null
-    *   db:     2026-07-06 09:31:16+00, timezone: null
-    *
-    * UTC here is only a neutral storage zone to avoid JS/container timezone shifting.
-    */
-    if (dateTimeOriginal && !dateTime?.hasZone && timeZone == null) {
-      const rawWallTime = dateTimeOriginal.setZone('UTC', { keepLocalTime: true });
-      dateTimeOriginal = rawWallTime;
-      localDateTime = rawWallTime;
-    } else {
-      // do not let JavaScript use local timezone
-      if (dateTimeOriginal && !dateTime?.hasZone) {
-        dateTimeOriginal = dateTimeOriginal.setZone('UTC', { keepLocalTime: true });
-      }
-
-      // align with whatever timeZone we chose
-      dateTimeOriginal = dateTimeOriginal?.setZone(timeZone ?? 'UTC');
-
-      // store as "local time"
-      localDateTime = dateTimeOriginal?.setZone('UTC', { keepLocalTime: true });
+    // do not let JavaScript use local timezone
+    if (dateTimeOriginal && !dateTime?.hasZone) {
+      dateTimeOriginal = dateTimeOriginal.setZone('UTC', { keepLocalTime: true });
     }
+
+    // align with whatever timeZone we chose
+    dateTimeOriginal = dateTimeOriginal?.setZone(timeZone ?? 'UTC');
+
+    // store as "local time"
+    let localDateTime = dateTimeOriginal?.setZone('UTC', { keepLocalTime: true });
 
     if (!localDateTime || !dateTimeOriginal) {
       // FileCreateDate is not available on linux, likely because exiftool hasn't integrated the statx syscall yet
@@ -1058,23 +1039,11 @@ export class MetadataService extends BaseService {
           stats.birthtimeMs ? Math.min(stats.mtimeMs, stats.birthtimeMs) : stats.mtime.getTime(),
         ),
       );
-
       this.logger.debug(
         `No exif date time found, falling back on ${earliestDate.toISO()}, earliest of file creation and modification for asset ${asset.id}: ${asset.originalPath}`,
       );
-
-      /*
-      * No EXIF date/time:
-      * preserve the file timestamp as wall-clock time, instead of storing the UTC instant.
-      *
-      * Example with TZ=Asia/Tokyo:
-      *   stat shows 2026-07-06 09:31:16 +0900
-      *   db stores 2026-07-06 09:31:16+00
-      *
-      * This is intentionally not a timezone inference. timeZone remains null.
-      */
-      const rawWallTime = earliestDate.setZone('UTC', { keepLocalTime: true });
-      dateTimeOriginal = localDateTime = rawWallTime;
+      dateTimeOriginal = earliestDate;
+      localDateTime = earliestDate.setZone('UTC', { keepLocalTime: true });
     }
 
     this.logger.verbose(`Found local date time ${localDateTime.toISO()} for asset ${asset.id}: ${asset.originalPath}`);
