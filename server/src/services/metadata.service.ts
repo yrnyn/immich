@@ -1018,18 +1018,28 @@ export class MetadataService extends BaseService {
     }
 
     let dateTimeOriginal = dateTime?.toDateTime();
+    let localDateTime: DateTime | undefined;
 
-    // do not let JavaScript use local timezone
-    if (dateTimeOriginal && !dateTime?.hasZone) {
+    // If the source metadata has no explicit timezone and Immich did not infer one,
+    // preserve the raw wall-clock time exactly as written in the file.
+    // The UTC zone here is only used as a neutral storage container to prevent
+    // JavaScript/container local timezone from shifting the clock value.
+    if (dateTimeOriginal && !dateTime?.hasZone && timeZone == null) {
       dateTimeOriginal = dateTimeOriginal.setZone('UTC', { keepLocalTime: true });
+      localDateTime = dateTimeOriginal;
+    } else {
+      // do not let JavaScript use local timezone
+      if (dateTimeOriginal && !dateTime?.hasZone) {
+        dateTimeOriginal = dateTimeOriginal.setZone('UTC', { keepLocalTime: true });
+      }
+
+      // align with whatever timeZone we chose
+      dateTimeOriginal = dateTimeOriginal?.setZone(timeZone ?? 'UTC');
+
+      // store as "local time"
+      localDateTime = dateTimeOriginal?.setZone('UTC', { keepLocalTime: true });
     }
-
-    // align with whatever timeZone we chose
-    dateTimeOriginal = dateTimeOriginal?.setZone(timeZone ?? 'UTC');
-
-    // store as "local time"
-    let localDateTime = dateTimeOriginal?.setZone('UTC', { keepLocalTime: true });
-
+    
     if (!localDateTime || !dateTimeOriginal) {
       // FileCreateDate is not available on linux, likely because exiftool hasn't integrated the statx syscall yet
       // birthtime is not available in Docker on macOS, so it appears as 0
