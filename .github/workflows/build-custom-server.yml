@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - v3.0.1-tz-null-fix
+      - v3.0.2-tz-null-fix
 
 permissions:
   contents: read
@@ -12,7 +12,7 @@ permissions:
 
 env:
   IMAGE_NAME: ghcr.io/yrnyn/immich-server
-  IMAGE_TAG: v3.0.1-tz-null-fix
+  IMAGE_TAG: v3.0.2-tz-null-fix
 
 jobs:
   build:
