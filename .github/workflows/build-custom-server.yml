@@ -45,6 +45,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Resolve floating major tag
+        id: floating_tag
+        shell: bash
+        run: |
+          IMAGE_TAG="${{ steps.release.outputs.image_tag }}"
+          [[ "$IMAGE_TAG" =~ ^(v[0-9]+)\.[0-9]+\.[0-9]+ ]]; then
+            MAJOR_TAG="${BASH_REMATCH[1]}"
+
       - name: Build and push custom immich-server
         uses: docker/build-push-action@v7
         with:
@@ -55,6 +63,7 @@ jobs:
           tags: |
             ${{ env.IMAGE_NAME }}:${{ steps.release.outputs.image_tag }}
             ${{ env.IMAGE_NAME }}:${{ steps.release.outputs.image_tag }}-${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:${{ steps.floating_tag.outputs.major_tag }}
           build-args: |
             BUILD_ID=${{ github.run_id }}
             BUILD_IMAGE=${{ env.IMAGE_NAME }}:${{ steps.release.outputs.image_tag }}
