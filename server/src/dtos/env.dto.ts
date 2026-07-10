@@ -59,6 +59,10 @@ export const EnvSchema = z
     IMMICH_SOURCE_REF: z.string().optional(),
     IMMICH_SOURCE_COMMIT: z.string().optional(),
     IMMICH_SOURCE_URL: z.string().optional(),
+    IMMICH_VERSION_CHECK_REPOSITORY: z
+      .string()
+      .regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/)
+      .optional(),
     IMMICH_TELEMETRY_INCLUDE: z.string().optional(),
     IMMICH_TELEMETRY_EXCLUDE: z.string().optional(),
     IMMICH_THIRD_PARTY_SOURCE_URL: z.string().optional(),
