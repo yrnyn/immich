@@ -1,18 +1,16 @@
 name: Build custom Immich server
 
 on:
-  workflow_dispatch:
   push:
-    branches:
-      - v3.0.2-tz-null-fix
+    tags:
+      - 'v*-tz-null-fix'
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 env:
   IMAGE_NAME: ghcr.io/yrnyn/immich-server
-  IMAGE_TAG: v3.0.2-tz-null-fix
 
 jobs:
   build:
@@ -21,6 +19,21 @@ jobs:
     steps:
       - name: Checkout source
         uses: actions/checkout@v6
+
+      - name: Validate release tag
+        id: release
+        shell: bash
+        run: |
+          source_version="$(node -p "require('./server/package.json').version")"
+          expected_tag="v${source_version}-tz-null-fix"
+
+          if [[ "$GITHUB_REF_NAME" != "$expected_tag" ]]; then
+            echo "Release tag must be ${expected_tag}, received ${GITHUB_REF_NAME}." >&2
+            exit 1
+          fi
+
+          echo "image_tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          echo "server_version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -40,12 +53,26 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
-            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}-${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:${{ steps.release.outputs.image_tag }}
+            ${{ env.IMAGE_NAME }}:${{ steps.release.outputs.image_tag }}-${{ github.sha }}
           build-args: |
             BUILD_ID=${{ github.run_id }}
-            BUILD_IMAGE=${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+            BUILD_IMAGE=${{ env.IMAGE_NAME }}:${{ steps.release.outputs.image_tag }}
             BUILD_SOURCE_REF=${{ github.ref_name }}
             BUILD_SOURCE_COMMIT=${{ github.sha }}
+            IMMICH_SERVER_VERSION=${{ steps.release.outputs.server_version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" --title "Immich $GITHUB_REF_NAME" --generate-notes
