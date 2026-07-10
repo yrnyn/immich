@@ -69,8 +69,8 @@ jobs:
             exit 1
           fi
 
-          COMPOSE_SOURCE="docker/docker-compose-custom.yml"
-          ENV_SOURCE="docker/example-custom.env"
+          COMPOSE_SOURCE="docker/docker-compose.custom.yml"
+          ENV_SOURCE="docker/example.custom.env"
 
           if [[ ! -f "$COMPOSE_SOURCE" ]]; then
             echo "::error::File not found: $COMPOSE_SOURCE"
