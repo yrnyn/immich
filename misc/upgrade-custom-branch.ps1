@@ -1,14 +1,12 @@
 <#
 .SYNOPSIS
-Creates a versioned custom branch by replaying the timezone patch on a newer Immich release.
+Rebases the long-lived timezone-fix branch onto a newer Immich release.
 
 .DESCRIPTION
-The current branch must use the naming pattern vX.Y.Z-tz-null-fix. The script fetches
-the requested upstream tag, creates vA.B.C-tz-null-fix, replays the custom commits onto
-that tag, updates and commits the custom-image workflow, and checks the resulting patch.
-Existing versioned custom branches are never changed. The script asks before it
-creates/rebases a branch and, when -Push is supplied, again before it publishes to origin.
-The confirmed push starts the custom-image GitHub Actions workflow for the new version.
+The current branch must be tz-null-fix. The script finds the newest official vX.Y.Z
+tag already contained by that branch, fetches the requested newer upstream tag, and
+rebases the custom commits in place. It never creates a release tag or Docker image;
+those are created only after review and testing.
 
 .EXAMPLE
 ./misc/upgrade-custom-branch.ps1 -TargetTag v3.0.3
@@ -28,6 +26,9 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+$MaintenanceBranch = 'tz-null-fix'
+$ReleaseSuffix = '-tz-null-fix'
 
 function Invoke-Git {
   param([Parameter(ValueFromRemainingArguments = $true)][string[]]$GitArgs)
@@ -52,6 +53,22 @@ function Confirm-Action {
   return $answer.Trim().ToLowerInvariant() -in @('y', 'yes')
 }
 
+function Get-BaseReleaseTag {
+  param([string]$Branch)
+
+  $tags = @(
+    & git tag --merged $Branch --list 'v*' |
+      Where-Object { $_ -match '^v\d+\.\d+\.\d+$' } |
+      Sort-Object { [Version]$_.Substring(1) } -Descending
+  )
+
+  if (-not $tags) {
+    throw "No official vX.Y.Z tag is an ancestor of '$Branch'."
+  }
+
+  return $tags[0]
+}
+
 try {
   $repoRoot = (& git rev-parse --show-toplevel).Trim()
   if ($LASTEXITCODE -ne 0) {
@@ -69,21 +86,16 @@ try {
   }
 
   $sourceBranch = (& git branch --show-current).Trim()
-  if (-not $sourceBranch) {
-    throw 'Detached HEAD is not supported. Switch to a versioned custom branch first.'
+  if ($sourceBranch -ne $MaintenanceBranch) {
+    throw "Current branch '$sourceBranch' must be '$MaintenanceBranch'."
   }
 
-  if ($sourceBranch -notmatch '^(?<sourceTag>v\d+\.\d+\.\d+)(?<suffix>-tz-null-fix)$') {
-    throw "Current branch '$sourceBranch' must match vX.Y.Z-tz-null-fix."
-  }
-
-  $sourceTag = $Matches.sourceTag
-  $newBranch = "$TargetTag$($Matches.suffix)"
+  $sourceTag = Get-BaseReleaseTag $MaintenanceBranch
 
   $sourceVersion = [Version]$sourceTag.Substring(1)
   $targetVersion = [Version]$TargetTag.Substring(1)
   if ($targetVersion -le $sourceVersion) {
-    throw "Target tag '$TargetTag' must be newer than source tag '$sourceTag'."
+    throw "Target tag '$TargetTag' must be newer than current base tag '$sourceTag'."
   }
 
   Invoke-Git remote get-url origin *> $null
@@ -99,95 +111,61 @@ try {
     throw "Target tag '$TargetTag' was not fetched from upstream."
   }
 
-  & git merge-base --is-ancestor $sourceTag $sourceBranch
+  & git merge-base --is-ancestor $sourceTag $MaintenanceBranch
   if ($LASTEXITCODE -ne 0) {
-    throw "Source tag '$sourceTag' is not an ancestor of '$sourceBranch'."
-  }
-
-  if (Test-GitRef "refs/heads/$newBranch") {
-    throw "Local branch '$newBranch' already exists; it will not be changed."
-  }
-
-  $remoteBranch = & git ls-remote --heads origin "refs/heads/$newBranch"
-  if ($LASTEXITCODE -ne 0) {
-    throw "Unable to check whether '$newBranch' already exists on origin."
-  }
-  if ($remoteBranch) {
-    throw "Remote branch '$newBranch' already exists; it will not be changed."
+    throw "Current base tag '$sourceTag' is not an ancestor of '$MaintenanceBranch'."
   }
 
   Write-Host "`nUpgrade plan:"
-  Write-Host "  Source branch: $sourceBranch"
-  Write-Host "  Source tag:    $sourceTag"
-  Write-Host "  Target tag:    $TargetTag"
-  Write-Host "  New branch:    $newBranch"
+  Write-Host "  Maintenance branch: $MaintenanceBranch"
+  Write-Host "  Current base tag:   $sourceTag"
+  Write-Host "  Target base tag:    $TargetTag"
   Write-Host "`nCommits to replay:"
-  Invoke-Git log --oneline "$sourceTag..$sourceBranch"
+  Invoke-Git log --oneline "$sourceTag..$MaintenanceBranch"
 
-  if (-not (Confirm-Action "Create '$newBranch' and rebase these commits onto '$TargetTag'?")) {
-    Write-Host 'Canceled before creating a branch. No Git history was changed.'
+  if (-not (Confirm-Action "Rebase '$MaintenanceBranch' onto '$TargetTag'?")) {
+    Write-Host 'Canceled before rebasing. No Git history was changed.'
     return
   }
-
-  Write-Host "Creating $newBranch from $sourceBranch..."
-  Invoke-Git switch -c $newBranch $sourceBranch
 
   try {
     Invoke-Git rebase --onto $TargetTag $sourceTag
   } catch {
-    Write-Error "Rebase stopped on '$newBranch'. Resolve the conflicts, then run 'git rebase --continue'."
-    Write-Error "To abandon this upgrade attempt, run 'git rebase --abort' and then switch back to '$sourceBranch'."
+    Write-Error "Rebase stopped on '$MaintenanceBranch'. Resolve the conflicts, then run 'git rebase --continue'."
+    Write-Error "To abandon this upgrade attempt, run 'git rebase --abort'."
     throw
   }
 
-  Invoke-Git range-diff "$sourceTag..$sourceBranch" "$TargetTag..HEAD"
-
-  $workflowPath = Join-Path $repoRoot '.github/workflows/build-custom-server.yml'
-  if (-not (Test-Path -LiteralPath $workflowPath)) {
-    throw "Custom-image workflow '$workflowPath' does not exist."
+  $packageVersion = (Get-Content server/package.json -Raw | ConvertFrom-Json).version
+  if ($packageVersion -ne $TargetTag.Substring(1)) {
+    throw "server/package.json is $packageVersion, but '$TargetTag' requires $($TargetTag.Substring(1))."
   }
 
-  if (-not (Confirm-Action "Update the custom-image workflow for '$newBranch' and commit it?")) {
-    Write-Host "Workflow was not changed. '$newBranch' remains local and is not ready to trigger a new image build."
-    return
-  }
-
-  $workflow = [System.IO.File]::ReadAllText($workflowPath) -replace "`r`n", "`n"
-  $branchPattern = '(?m)^      - v\d+\.\d+\.\d+-tz-null-fix$'
-  $tagPattern = '(?m)^  IMAGE_TAG: v\d+\.\d+\.\d+-tz-null-fix$'
-  if ([regex]::Matches($workflow, $branchPattern).Count -ne 1 -or [regex]::Matches($workflow, $tagPattern).Count -ne 1) {
-    throw "Custom-image workflow must contain exactly one versioned branch trigger and IMAGE_TAG."
-  }
-
-  $workflow = [regex]::Replace($workflow, $branchPattern, "      - $newBranch")
-  $workflow = [regex]::Replace($workflow, $tagPattern, "  IMAGE_TAG: $newBranch")
-  [System.IO.File]::WriteAllText($workflowPath, $workflow, [System.Text.UTF8Encoding]::new($false))
-
-  Invoke-Git add -- .github/workflows/build-custom-server.yml
-  Invoke-Git diff --cached -- .github/workflows/build-custom-server.yml
-  Invoke-Git commit -m "ci: build custom image for $TargetTag"
-
+  Invoke-Git range-diff "$sourceTag..$MaintenanceBranch@{1}" "$TargetTag..HEAD"
   Invoke-Git diff --check "$TargetTag...HEAD"
   Invoke-Git diff --stat "$TargetTag...HEAD"
 
   & git merge-base --is-ancestor $TargetTag HEAD
   if ($LASTEXITCODE -ne 0) {
-    throw "Target tag '$TargetTag' is not an ancestor of '$newBranch' after rebase."
+    throw "Target tag '$TargetTag' is not an ancestor of '$MaintenanceBranch' after rebase."
   }
 
-  Write-Host "`nUpgrade branch '$newBranch' is ready."
-  Write-Host "Review: git diff $TargetTag...HEAD -- server/src/services/metadata.service.ts"
+  $releaseTag = "$TargetTag$ReleaseSuffix"
+  Write-Host "`nRebase complete. Verify and test this branch before publishing."
+  Write-Host "Release tag: $releaseTag"
+  Write-Host "Publish after testing:"
+  Write-Host "  git tag -a $releaseTag -m 'Release $releaseTag'"
+  Write-Host "  git push origin $releaseTag"
 
   if ($Push) {
-    if (-not (Confirm-Action "Push '$newBranch' to origin?")) {
-      Write-Host "Not pushed. Publishing this branch will start the custom-image workflow: git push -u origin $newBranch"
+    if (-not (Confirm-Action "Force-push rebased '$MaintenanceBranch' to origin with --force-with-lease?")) {
+      Write-Host "Not pushed. After testing: git push --force-with-lease -u origin $MaintenanceBranch"
       return
     }
 
-    Write-Host "Pushing $newBranch to origin..."
-    Invoke-Git push -u origin $newBranch
+    Invoke-Git push --force-with-lease -u origin $MaintenanceBranch
   } else {
-    Write-Host "Not pushed. After review and testing, publish with: git push -u origin $newBranch"
+    Write-Host "Not pushed. After testing: git push --force-with-lease -u origin $MaintenanceBranch"
   }
 } finally {
   if (Get-Location) {

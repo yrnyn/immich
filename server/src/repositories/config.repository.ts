@@ -75,6 +75,7 @@ export interface EnvData {
 
   versionCheck: {
     url: string;
+    repository?: string;
   };
 
   network: {
@@ -321,6 +322,7 @@ const getEnv = (): EnvData => {
 
     versionCheck: {
       url: isProd ? 'https://version.immich.cloud/version' : 'https://version.dev.immich.cloud/version',
+      repository: dto.IMMICH_VERSION_CHECK_REPOSITORY,
     },
 
     network: {

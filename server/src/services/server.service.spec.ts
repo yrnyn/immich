@@ -1,5 +1,6 @@
 import { SystemMetadataKey } from 'src/enum';
 import { ServerService } from 'src/services/server.service';
+import { mockEnvData } from 'test/repositories/config.repository.mock';
 import { newTestService, ServiceMocks } from 'test/utils';
 
 describe(ServerService.name, () => {
@@ -12,6 +13,24 @@ describe(ServerService.name, () => {
 
   it('should work', () => {
     expect(sut).toBeDefined();
+  });
+
+  describe('getAboutInfo', () => {
+    it('should use the build repository for the version link', async () => {
+      mocks.config.getEnv.mockReturnValue(
+        mockEnvData({
+          buildMetadata: {
+            repositoryUrl: 'https://github.com/yrnyn/immich',
+          },
+        }),
+      );
+
+      await expect(sut.getAboutInfo()).resolves.toEqual(
+        expect.objectContaining({
+          versionUrl: 'https://github.com/yrnyn/immich/releases/tag/v3.0.2',
+        }),
+      );
+    });
   });
 
   describe('getStorage', () => {

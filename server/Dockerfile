@@ -12,6 +12,7 @@ RUN npm install --global corepack@latest && \
 FROM builder AS server
 
 WORKDIR /usr/src/app
+ARG IMMICH_SERVER_VERSION
 COPY ./server ./server/
 COPY ./packages/sdk ./packages/sdk/
 COPY ./packages/plugin-sdk ./packages/plugin-sdk/
@@ -20,6 +21,7 @@ RUN --mount=type=cache,id=pnpm-server,target=/buildcache/pnpm-store \
   --mount=type=bind,source=.pnpmfile.cjs,target=.pnpmfile.cjs \
   --mount=type=bind,source=pnpm-lock.yaml,target=pnpm-lock.yaml \
   --mount=type=bind,source=pnpm-workspace.yaml,target=pnpm-workspace.yaml \
+  if [ -n "$IMMICH_SERVER_VERSION" ]; then npm pkg set --prefix ./server "version=$IMMICH_SERVER_VERSION"; fi && \
   SHARP_IGNORE_GLOBAL_LIBVIPS=true pnpm --filter @immich/sdk --filter @immich/plugin-sdk --filter immich build && \
   SHARP_FORCE_GLOBAL_LIBVIPS=true  pnpm --filter immich --prod --no-optional deploy /output/server-pruned
 
@@ -104,14 +106,15 @@ ARG BUILD_SOURCE_REF
 ARG BUILD_SOURCE_COMMIT
 
 ENV IMMICH_BUILD=${BUILD_ID}
-ENV IMMICH_BUILD_URL=https://github.com/immich-app/immich/actions/runs/${BUILD_ID}
+ENV IMMICH_BUILD_URL=https://github.com/yrnyn/immich/actions/runs/${BUILD_ID}
 ENV IMMICH_BUILD_IMAGE=${BUILD_IMAGE}
-ENV IMMICH_BUILD_IMAGE_URL=https://github.com/immich-app/immich/pkgs/container/immich-server
-ENV IMMICH_REPOSITORY=immich-app/immich
-ENV IMMICH_REPOSITORY_URL=https://github.com/immich-app/immich
+ENV IMMICH_BUILD_IMAGE_URL=https://github.com/yrnyn/immich/pkgs/container/immich-server
+ENV IMMICH_REPOSITORY=yrnyn/immich
+ENV IMMICH_REPOSITORY_URL=https://github.com/yrnyn/immich
 ENV IMMICH_SOURCE_REF=${BUILD_SOURCE_REF}
 ENV IMMICH_SOURCE_COMMIT=${BUILD_SOURCE_COMMIT}
-ENV IMMICH_SOURCE_URL=https://github.com/immich-app/immich/commit/${BUILD_SOURCE_COMMIT}
+ENV IMMICH_SOURCE_URL=https://github.com/yrnyn/immich/commit/${BUILD_SOURCE_COMMIT}
+ENV IMMICH_VERSION_CHECK_REPOSITORY=yrnyn/immich
 
 VOLUME /data
 EXPOSE 2283
