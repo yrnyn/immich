@@ -1,0 +1,182 @@
+name: Publish Docker deployment files
+
+run-name: Publish Docker files - ${{ inputs.release_tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "v3 通用部署接口的既有 Release tag；当前为 v3.0.2-tz-null-fix，原地更新附件"
+        required: true
+        type: string
+
+      release_title:
+        description: "Release title"
+        required: true
+        type: string
+
+      release_notes:
+        description: "Release notes；换行可写成 \\n"
+        required: false
+        default: ""
+        type: string
+
+      release_notes_file:
+        description: "可选：仓库内 Release notes Markdown 文件路径"
+        required: false
+        default: ""
+        type: string
+
+      mark_as_latest:
+        description: "设为 Latest Release"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-docker-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish Docker release assets
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout selected branch
+        uses: actions/checkout@v4
+
+      - name: Validate and prepare release files
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+          RELEASE_NOTES_FILE: ${{ inputs.release_notes_file }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$RELEASE_TAG" ]]; then
+            echo "::error::release_tag cannot be empty"
+            exit 1
+          fi
+
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([._-][0-9A-Za-z._-]+)?$ ]]; then
+            echo "::error::Invalid release tag: $RELEASE_TAG"
+            echo "Expected format similar to: v3.0.2-tz-null-fix"
+            exit 1
+          fi
+
+          COMPOSE_SOURCE="docker/docker-compose.custom.yml"
+          ENV_SOURCE="docker/example.custom.env"
+
+          if [[ ! -f "$COMPOSE_SOURCE" ]]; then
+            echo "::error::File not found: $COMPOSE_SOURCE"
+            exit 1
+          fi
+
+          if [[ ! -f "$ENV_SOURCE" ]]; then
+            echo "::error::File not found: $ENV_SOURCE"
+            exit 1
+          fi
+
+          rm -rf release-assets
+          mkdir -p release-assets
+
+          # 上传 Release 时改成官方使用的文件名；这是 v3 通用部署接口的附件
+          cp "$COMPOSE_SOURCE" "release-assets/docker-compose.yml"
+          cp "$ENV_SOURCE" "release-assets/example.env"
+
+          # 优先使用仓库里的 Markdown 文件
+          if [[ -n "$RELEASE_NOTES_FILE" ]]; then
+            if [[ ! -f "$RELEASE_NOTES_FILE" ]]; then
+              echo "::error::Release notes file not found: $RELEASE_NOTES_FILE"
+              exit 1
+            fi
+
+            cp "$RELEASE_NOTES_FILE" "release-assets/RELEASE_NOTES.md"
+          else
+            # 将输入中的字面量 \n 转换为真正换行
+            python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          notes = os.environ.get("RELEASE_NOTES", "")
+          notes = notes.replace("\\n", "\n")
+
+          if not notes.strip():
+              notes = "Custom Immich Docker deployment release."
+
+          Path("release-assets/RELEASE_NOTES.md").write_text(
+              notes.rstrip() + "\n",
+              encoding="utf-8",
+          )
+          PY
+          fi
+
+          echo "Prepared release files:"
+          ls -lh release-assets
+
+          echo
+          echo "Release notes:"
+          cat release-assets/RELEASE_NOTES.md
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_TITLE: ${{ inputs.release_title }}
+          MARK_AS_LATEST: ${{ inputs.mark_as_latest }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$MARK_AS_LATEST" == "true" ]]; then
+            LATEST_ARGS=(--latest)
+          else
+            LATEST_ARGS=(--latest=false)
+          fi
+
+          if gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+
+            echo "Release already exists; updating its v3 deployment assets in place: $RELEASE_TAG"
+
+            gh release edit "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$RELEASE_TITLE" \
+              --notes-file "release-assets/RELEASE_NOTES.md" \
+              "${LATEST_ARGS[@]}"
+
+            gh release upload "$RELEASE_TAG" \
+              "release-assets/docker-compose.yml" \
+              "release-assets/example.env" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            echo "Creating release: $RELEASE_TAG"
+
+            gh release create "$RELEASE_TAG" \
+              "release-assets/docker-compose.yml" \
+              "release-assets/example.env" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$RELEASE_TITLE" \
+              --notes-file "release-assets/RELEASE_NOTES.md" \
+              "${LATEST_ARGS[@]}"
+          fi
+
+      - name: Show download URLs
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          echo "Latest release URLs:"
+          echo "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/docker-compose.yml"
+          echo "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/example.env"
+          echo
+          echo "Version-specific URLs:"
+          echo "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/docker-compose.yml"
+          echo "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/example.env"

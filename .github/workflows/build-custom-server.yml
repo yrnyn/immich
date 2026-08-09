@@ -1,0 +1,134 @@
+name: Build custom Immich server
+
+on:
+  push:
+    tags:
+      - 'v*-tz-null-fix'
+  workflow_dispatch:
+    inputs:
+      build_label:
+        description: '构建标签，如 hotfix1（留空则只用 commit sha 标识）'
+        required: false
+        default: ''
+        type: string
+      publish_deployment_tag:
+        description: '打上部署 tag v3（部署环境会拉到本次构建）'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/yrnyn/immich-server
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+
+      - name: Resolve image metadata
+        id: release
+        shell: bash
+        env:
+          BUILD_LABEL: ${{ inputs.build_label }}
+          PUBLISH_DEPLOYMENT_TAG: ${{ inputs.publish_deployment_tag }}
+        run: |
+          set -euo pipefail
+
+          source_version="$(node -p "require('./server/package.json').version")"
+          release_tag="v${source_version}-tz-null-fix"
+
+          if [[ ! "$release_tag" =~ ^(v[0-9]+)\.[0-9]+\.[0-9]+-tz-null-fix$ ]]; then
+            echo "Unable to derive image tags from server version ${source_version}." >&2
+            exit 1
+          fi
+
+          major_tag="${BASH_REMATCH[1]}"
+          immutable_tag="${release_tag}-${GITHUB_SHA}"
+          image_tags=("${IMAGE_NAME}:${immutable_tag}")
+          primary_tag="$immutable_tag"
+          source_ref="$GITHUB_REF_NAME"
+
+          case "$GITHUB_EVENT_NAME" in
+            push)
+              if [[ "$GITHUB_REF_TYPE" != "tag" || "$GITHUB_REF_NAME" != "$release_tag" ]]; then
+                echo "Release tag must be ${release_tag}, received ${GITHUB_REF_NAME}." >&2
+                exit 1
+              fi
+
+              image_tags=(
+                "${IMAGE_NAME}:${release_tag}"
+                "${IMAGE_NAME}:${immutable_tag}"
+                "${IMAGE_NAME}:${major_tag}"
+              )
+              primary_tag="$release_tag"
+              ;;
+            workflow_dispatch)
+              if [[ "$GITHUB_REF_TYPE" != "branch" ]]; then
+                echo "Manual builds must run from a branch, received ${GITHUB_REF_TYPE} ${GITHUB_REF_NAME}." >&2
+                exit 1
+              fi
+
+              if [[ -n "$BUILD_LABEL" ]]; then
+                if [[ ! "$BUILD_LABEL" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+                  echo "Build label must match [A-Za-z0-9][A-Za-z0-9._-]*, received ${BUILD_LABEL}." >&2
+                  exit 1
+                fi
+
+                labeled_tag="${release_tag}-${BUILD_LABEL}"
+                image_tags+=("${IMAGE_NAME}:${labeled_tag}")
+                primary_tag="$labeled_tag"
+                source_ref="$labeled_tag"
+              fi
+
+              if [[ "$PUBLISH_DEPLOYMENT_TAG" == "true" ]]; then
+                image_tags+=("${IMAGE_NAME}:${major_tag}")
+              fi
+              ;;
+            *)
+              echo "Unsupported event: ${GITHUB_EVENT_NAME}." >&2
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "image_tags<<EOF"
+            printf '%s\n' "${image_tags[@]}"
+            echo "EOF"
+            echo "primary_tag=${primary_tag}"
+            echo "source_ref=${source_ref}"
+            echo "server_version=${source_version}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push custom immich-server
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: server/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.release.outputs.image_tags }}
+          build-args: |
+            BUILD_ID=${{ github.run_id }}
+            BUILD_IMAGE=${{ env.IMAGE_NAME }}:${{ steps.release.outputs.primary_tag }}
+            BUILD_SOURCE_REF=${{ steps.release.outputs.source_ref }}
+            BUILD_SOURCE_COMMIT=${{ github.sha }}
+            IMMICH_SERVER_VERSION=${{ steps.release.outputs.server_version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
