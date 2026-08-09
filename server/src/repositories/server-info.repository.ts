@@ -16,6 +16,8 @@ export interface GitHubRelease {
   created_at: string;
   published_at: string;
   body: string;
+  draft: boolean;
+  prerelease: boolean;
 }
 
 export interface VersionResponse {
@@ -68,6 +70,10 @@ export class ServerInfoRepository {
   async getLatestRelease(channel: ReleaseChannel): Promise<VersionResponse> {
     try {
       const { versionCheck } = this.configRepository.getEnv();
+      if (versionCheck.repository) {
+        return await this.getLatestGitHubRelease(versionCheck.repository, channel);
+      }
+
       const url = new URL(versionCheck.url);
       switch (channel) {
         case ReleaseChannel.Stable: {
@@ -89,6 +95,31 @@ export class ServerInfoRepository {
     } catch (error) {
       throw new Error('Failed to fetch latest release', { cause: error });
     }
+  }
+
+  private async getLatestGitHubRelease(repository: string, channel: ReleaseChannel): Promise<VersionResponse> {
+    const endpoint = `https://api.github.com/repos/${repository}/releases`;
+    const url = channel === ReleaseChannel.Stable ? `${endpoint}/latest` : endpoint;
+    const response = await fetch(url);
+
+    if (!response.ok) {
+      throw new Error(`GitHub release request failed with status ${response.status}: ${await response.text()}`);
+    }
+
+    let release: GitHubRelease | undefined;
+    if (channel === ReleaseChannel.Stable) {
+      release = await response.json();
+    } else {
+      const releases: GitHubRelease[] = await response.json();
+      release =
+        releases.find((release) => release.prerelease && !release.draft) ?? releases.find((release) => !release.draft);
+    }
+
+    if (!release) {
+      throw new Error(`No published GitHub release found for ${repository}`);
+    }
+
+    return { version: release.tag_name, published_at: release.published_at };
   }
 
   buildVersions?: ServerBuildVersions;

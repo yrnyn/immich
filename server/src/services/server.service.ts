@@ -42,12 +42,13 @@ export class ServerService extends BaseService {
   async getAboutInfo(): Promise<ServerAboutResponseDto> {
     const version = `v${serverVersion.toString()}`;
     const { buildMetadata } = this.configRepository.getEnv();
+    const repositoryUrl = buildMetadata.repositoryUrl || 'https://github.com/immich-app/immich';
     const buildVersions = await this.serverInfoRepository.getBuildVersions();
     const licensed = await this.systemMetadataRepository.get(SystemMetadataKey.License);
 
     return {
       version,
-      versionUrl: `https://github.com/immich-app/immich/releases/tag/${version}`,
+      versionUrl: `${repositoryUrl}/releases/tag/${version}`,
       licensed: !!licensed,
       ...buildMetadata,
       ...buildVersions,
