@@ -276,7 +276,7 @@ describe(MetadataService.name, () => {
       });
     });
 
-    it('should determine dateTimeOriginal regardless of the server time zone', async () => {
+    it('should interpret a date without time zone in the server time zone', async () => {
       process.env.TZ = 'America/Los_Angeles';
       const asset = AssetFactory.create();
       mocks.assetJob.getForMetadataExtraction.mockResolvedValue(getForMetadataExtraction(asset));
@@ -286,7 +286,8 @@ describe(MetadataService.name, () => {
       expect(mocks.asset.upsertExif).toHaveBeenCalledWith(
         expect.objectContaining({
           exif: expect.objectContaining({
-            dateTimeOriginal: new Date('2022-01-01T00:00:00.000Z'),
+            dateTimeOriginal: new Date('2022-01-01T08:00:00.000Z'),
+            timeZone: 'America/Los_Angeles',
           }),
           lockedPropertiesBehavior: 'skip',
         }),
