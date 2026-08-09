@@ -1,0 +1,373 @@
+name: Check upstream release
+
+# ============================================================================
+# 用途
+# ----
+# 每天预演一次"把 tz-null-fix 的定制提交 rebase 到上游最新正式版"，把结论写进
+# 一个 GitHub Issue。目的是把"上游更新了吗、这次跟进风险多大"从一次人工调查
+# 变成一条通知。
+#
+# 这个工作流完全只读：不推分支、不打 tag、不构建镜像、不碰部署环境。
+#
+# 为什么不顺便自动发布
+# ------------------
+# 推发布 tag 会触发 build-custom-server.yml：构建镜像 → 发 Release → 移动浮动的
+# v3 tag，而 v3 正是部署环境 docker compose pull 拉取的目标。也就是说自动打 tag
+# 等于自动上生产。
+#
+# 更关键的是一个技术理由：下面的 range-diff 检查显示"无漂移"，只能证明补丁的
+# **文本**没被 rebase 改写，不能证明补丁对**改动后的上游代码**仍然语义正确。
+# 时区补丁重写的是 metadata.service.ts 里的日期/时区处理逻辑；如果上游重构了
+# 附近的代码，补丁完全可能应用干净、编译通过、测试全绿，而行为是错的。
+# 那是需要人看两边 diff 才能判断的事，所以"要不要跟进"这一步必须留给人。
+#
+# 维护提示
+# -------
+# * schedule 只从仓库的**默认分支**触发。本 fork 的默认分支是 tz-null-fix，
+#   所以能正常跑。如果哪天把默认分支改回 main，这个工作流会**静默停止运行**
+#   （不会报错），请一并把它同步到新的默认分支或改回来。
+# * 下面的检查项刻意都是"便宜"的（纯 git 操作，无 pnpm / 无构建），所以每天跑
+#   的成本可以忽略。如果以后想加编译或单测，注意那会让每次有新版本时多几分钟。
+# * 这个文件属于定制提交，每次 rebase 都会被重放，改动请保持精简。
+# ============================================================================
+
+on:
+  schedule:
+    # 每天 03:17 UTC。上游无新版本时几秒内退出，所以频率高一点也没成本。
+    # 分钟数取非整点，避开 GitHub 整点的排队高峰。
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      target_tag:
+        description: '指定要预演的上游 tag，无论新旧都会跑完整预演并建 Issue（留空则取上游最新正式版，且仅在比基线新时才继续）'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read # 只读代码；不需要写权限，因为本工作流不推任何东西
+  issues: write # 唯一的副作用：创建/更新跟进 Issue
+
+concurrency:
+  group: check-upstream-release
+  # 只读工作流，后发起的运行结论更新，取消进行中的旧运行是安全的。
+  cancel-in-progress: true
+
+env:
+  MAINTENANCE_BRANCH: tz-null-fix
+  UPSTREAM_REPO: https://github.com/immich-app/immich.git
+  # 下面三个和 build-custom-server.yml 的 "Verify custom compose is in sync"
+  # 以及 misc/upgrade-custom-branch.ps1 保持同一套定义，改动要三处同步。
+  OFFICIAL_IMAGE_NAME: ghcr.io/immich-app/immich-server
+  OFFICIAL_COMPOSE: docker/docker-compose.yml
+  CUSTOM_COMPOSE: docker/docker-compose.custom.yml
+  MIGRATIONS_DIR: server/src/schema/migrations
+
+jobs:
+  check:
+    name: Dry-run rebase onto upstream
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout maintenance branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.MAINTENANCE_BRANCH }}
+          # 需要完整历史和全部 tag：要找"分支已包含的最高官方 tag"并做 rebase。
+          fetch-depth: 0
+
+      - name: Resolve base and target tags
+        id: tags
+        shell: bash
+        env:
+          TARGET_OVERRIDE: ${{ inputs.target_tag }}
+        run: |
+          set -euo pipefail
+
+          # rebase 需要提交者身份，即使结果不会被推送。
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          git remote add upstream "$UPSTREAM_REPO" 2>/dev/null || \
+            git remote set-url upstream "$UPSTREAM_REPO"
+
+          # 基线 = 维护分支当前所基于的官方正式版，从 server/package.json 读取。
+          #
+          # 不要改回"找最高的祖先 tag"：GitHub **不会**把上游新建的 tag 同步到 fork，
+          # 而 actions/checkout 只能取到 origin 的 tag。本 fork 的 tag 停在 v3.0.1，
+          # 按 tag 推断会得出严重过时的基线，误判成落后好几个版本（首次运行踩过）。
+          # package.json 的版本号由上游的 "chore: version vX.Y.Z" 提交维护，rebase
+          # 后自动跟着走；build-custom-server.yml 推导发布 tag 用的也是这个不变量。
+          source_version="$(node -p "require('./server/package.json').version")"
+          base="v${source_version}"
+
+          if [[ ! "$base" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::server/package.json version '${source_version}' is not a released vX.Y.Z; the branch may sit on a prerelease."
+            exit 1
+          fi
+
+          # 上游发布过的正式版清单。问远端而不是看本地 tag：本地/fork 的 tag 空间既
+          # 滞后于上游，又混着自己的 vX.Y.Z-tz-null-fix。
+          # sort -V 做版本号排序；字典序会把 v3.10.0 排在 v3.9.0 前面。
+          upstream_tags="$(git ls-remote --tags --refs upstream 'v*' \
+            | awk -F/ '{print $NF}' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V)"
+
+          if [[ -z "$upstream_tags" ]]; then
+            echo "::error::Could not list upstream release tags."
+            exit 1
+          fi
+
+          # 基线必须是上游真实发布过的版本，否则说明 package.json 与分支状态不一致。
+          if ! grep -qxF "$base" <<< "$upstream_tags"; then
+            echo "::error::Base ${base} (from server/package.json) is not a published upstream release."
+            exit 1
+          fi
+
+          if [[ -n "$TARGET_OVERRIDE" ]]; then
+            target="$TARGET_OVERRIDE"
+          else
+            target="$(tail -1 <<< "$upstream_tags")"
+          fi
+
+          # 定时运行时：target 严格新于 base 才继续，相等是常态（已经跟到最新）。
+          #
+          # 手动指定 target_tag 时跳过这道判断：指定 tag 的意思就是"拿这个跑一遍"，
+          # 无论新旧。否则填一个不比基线新的 tag（例如想验证工作流本身时填当前版本）
+          # 会被静默跳过，看起来像成功了其实什么都没做。
+          newer=false
+          if [[ -n "$TARGET_OVERRIDE" ]]; then
+            newer=true
+          elif [[ "$target" != "$base" && "$(printf '%s\n%s\n' "$base" "$target" | sort -V | tail -1)" == "$target" ]]; then
+            newer=true
+          fi
+
+          {
+            echo "base=${base}"
+            echo "target=${target}"
+            echo "newer=${newer}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Current base: ${base}"
+          echo "Upstream newest: ${target}"
+          echo "Newer release available: ${newer}"
+
+      - name: No newer release
+        if: steps.tags.outputs.newer != 'true'
+        shell: bash
+        env:
+          BASE: ${{ steps.tags.outputs.base }}
+          TARGET: ${{ steps.tags.outputs.target }}
+        run: |
+          # 常态路径：什么都不做，也不创建 Issue，避免噪音。
+          echo "### 上游无新版本" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "当前基线 \`${BASE}\`，上游最新 \`${TARGET}\`。无需跟进。" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Dry-run rebase and collect findings
+        if: steps.tags.outputs.newer == 'true'
+        id: dryrun
+        shell: bash
+        env:
+          BASE: ${{ steps.tags.outputs.base }}
+          TARGET: ${{ steps.tags.outputs.target }}
+        run: |
+          set -euo pipefail
+
+          # 基线和目标两个 tag 都要能在本地解析。
+          # 注意基线 tag 也可能缺失：GitHub 不把上游新 tag 同步到 fork，checkout 只
+          # 取得到 origin 的 tag，而基线是从 package.json 推出来的名字，未必在 origin。
+          for t in "$BASE" "$TARGET"; do
+            git rev-parse -q --verify "refs/tags/${t}^{commit}" >/dev/null && continue
+            git fetch --no-tags upstream "refs/tags/${t}:refs/tags/${t}"
+          done
+
+          # rebase 会移动 HEAD，先记下原始位置供 range-diff 比对。
+          before_head="$(git rev-parse HEAD)"
+          report="$(mktemp)"
+
+          # ---- 上游改动面 -------------------------------------------------
+          commit_count="$(git rev-list --count "${BASE}..${TARGET}")"
+
+          # docker/ 有变动 => 部署端必须覆盖 compose，且 custom compose 要重新生成。
+          docker_changed=no
+          if [[ -n "$(git diff --name-only "${BASE}..${TARGET}" -- docker/)" ]]; then
+            docker_changed=yes
+          fi
+
+          # 新迁移 => 升级不可逆性变高，回退前要备份数据库。
+          migration_count="$(git diff --name-only "${BASE}..${TARGET}" -- "$MIGRATIONS_DIR" | wc -l | tr -d ' ')"
+
+          # 定制提交碰过的文件 ∩ 上游本次改动的文件 = 潜在语义冲突点。
+          # 这是本工作流最重要的一项：它命中时，即使 rebase 干净、range-diff 无漂移，
+          # 也必须人工看两边的 diff。
+          # 无需维护文件名清单：纯定制新增的文件（本工作流、docker-compose.custom.yml、
+          # misc/*）不会出现在上游的改动集合里，求交集时自然被排除。
+          overlap="$(comm -12 \
+            <(git diff --name-only "${BASE}..${before_head}" | sort) \
+            <(git diff --name-only "${BASE}..${TARGET}" | sort) || true)"
+
+          # ---- 同步规则本身是否仍然可用 -----------------------------------
+          # 注意这和上面的 docker_changed 问的是两件事：
+          #   docker_changed  = 这次要不要重新生成 custom compose（常规操作）
+          #   rule_matches    = "只差 immich-server 镜像一行"这条规则还成不成立
+          # 后者失配说明上游改了 compose 结构，规则本身要改，三处（本文件、
+          # build-custom-server.yml、upgrade-custom-branch.ps1）都要更新。
+          rule_matches="$(git show "${TARGET}:${OFFICIAL_COMPOSE}" \
+            | grep -c "^[[:space:]]*image:[[:space:]]*${OFFICIAL_IMAGE_NAME}:" || true)"
+
+          # ---- 试跑 rebase -------------------------------------------------
+          rebase_ok=yes
+          conflicts=""
+          if ! git rebase --onto "$TARGET" "$BASE" >/dev/null 2>&1; then
+            rebase_ok=no
+            # 先取冲突文件，再 abort——abort 之后这个信息就没了。
+            conflicts="$(git diff --name-only --diff-filter=U || true)"
+            git rebase --abort || true
+          fi
+
+          drift=unknown
+          if [[ "$rebase_ok" == "yes" ]]; then
+            # range-diff 摘要行形如：  1:  abc1234 = 1:  def5678 <subject>
+            # 中间的标记：'=' 补丁未变；'!' 被改写；'<' 只在旧序列；'>' 只在新序列。
+            # 只要出现非 '=' 就说明 rebase 改动了补丁内容，需要人工核对。
+            if git range-diff --no-color "${BASE}..${before_head}" "${TARGET}..HEAD" \
+              | grep -qE '^[0-9]+: +[0-9a-f]+ [!<>] '; then
+              drift=yes
+            else
+              drift=no
+            fi
+          fi
+
+          echo "rebase_ok=${rebase_ok}" >> "$GITHUB_OUTPUT"
+
+          # ---- 组装报告 ----------------------------------------------------
+          # 文件列表压成一行塞进表格单元格。跨度大的升级可能命中几十个文件，
+          # 不截断会把表格撑爆，所以只列前 10 个并标出总数。
+          fmt_list() {
+            local list="$1" n
+            n="$(printf '%s\n' "$list" | grep -c . || true)"
+            if [[ "$n" -le 10 ]]; then
+              printf '%s' "$(printf '%s\n' "$list" | paste -sd' ' -)"
+            else
+              printf '%s … 等 %s 个' \
+                "$(printf '%s\n' "$list" | head -10 | paste -sd' ' -)" "$n"
+            fi
+          }
+
+          {
+            echo "预演把 \`${MAINTENANCE_BRANCH}\` 的定制提交 rebase 到上游 \`${TARGET}\`（当前基线 \`${BASE}\`，${commit_count} 个上游提交）。"
+            echo
+            echo "本次运行只读：未推送分支、未打 tag、未构建镜像。"
+            echo
+            echo "## 检查项"
+            echo
+            echo "| 检查 | 结果 |"
+            echo "| --- | --- |"
+
+            if [[ "$rebase_ok" == "yes" ]]; then
+              echo "| rebase | ✅ 干净 |"
+            else
+              echo "| rebase | ❌ **冲突**：$(fmt_list "$conflicts") |"
+            fi
+
+            case "$drift" in
+              no)  echo "| 补丁漂移（range-diff） | ✅ 无漂移 |" ;;
+              yes) echo "| 补丁漂移（range-diff） | ⚠️ **补丁内容被改写**，需人工核对 |" ;;
+              *)   echo "| 补丁漂移（range-diff） | — （rebase 未完成） |" ;;
+            esac
+
+            if [[ -z "$overlap" ]]; then
+              echo "| 上游是否改动定制文件 | ✅ 无重叠 |"
+            else
+              echo "| 上游是否改动定制文件 | ⚠️ **$(fmt_list "$overlap")** — 需人工核对语义 |"
+            fi
+
+            if [[ "$docker_changed" == "no" ]]; then
+              echo "| 部署文件 \`docker/\` | ✅ 无变动，部署端只需 pull |"
+            else
+              echo "| 部署文件 \`docker/\` | ⚠️ **有变动** — 需重新生成 custom compose，部署端需覆盖 |"
+            fi
+
+            if [[ "$rule_matches" == "1" ]]; then
+              echo "| Compose 同步规则 | ✅ 仍成立（恰好 1 行 immich-server 镜像） |"
+            else
+              echo "| Compose 同步规则 | ❌ **失配**（匹配到 ${rule_matches} 行）— 上游改了 compose 结构，规则需更新 |"
+            fi
+
+            if [[ "$migration_count" == "0" ]]; then
+              echo "| 数据库迁移 | ✅ 无新迁移，回退简单 |"
+            else
+              echo "| 数据库迁移 | ⚠️ **${migration_count} 个新迁移** — 升级前备份数据库 |"
+            fi
+
+            echo
+            echo "## 上游提交"
+            echo
+            # 按顶层目录标注影响面。注意 web/ 的改动同样影响部署：web 是 build 进
+            # immich-server 镜像的（见 server/Dockerfile）。只有 mobile/ 走应用商店。
+            # 0 提交只会出现在"手动填当前基线版本自测"的场景，真实跟进必然有提交。
+            if [[ "$commit_count" -eq 0 ]]; then
+              echo "（无）"
+            else
+              if [[ "$commit_count" -gt 60 ]]; then
+                echo "共 ${commit_count} 个，列出最近 60 个："
+                echo
+              fi
+              for c in $(git rev-list --reverse --max-count=60 "${BASE}..${TARGET}"); do
+                areas="$(git show --name-only --format= "$c" | awk -F/ 'NF{print $1}' | sort -u | paste -sd, -)"
+                printf -- "- \`%s\` **%s** — %s\n" \
+                  "$(git log -1 --format=%h "$c")" "${areas:-?}" "$(git log -1 --format=%s "$c")"
+              done
+            fi
+
+            echo
+            echo "## 跟进方式"
+            echo
+            echo '```powershell'
+            echo ".\\misc\\upgrade-custom-branch.ps1 -TargetTag ${TARGET}"
+            echo '```'
+            echo
+            echo "脚本会 rebase、跑 range-diff、校验 compose 同步；确认无误后推分支与发布 tag。"
+            echo "详见 [misc/upgrade-custom-branch.md](../blob/${MAINTENANCE_BRANCH}/misc/upgrade-custom-branch.md)。"
+            echo
+            echo "---"
+            echo "<sub>由 [check-upstream-release](https://github.com/${GITHUB_REPOSITORY}/actions/workflows/check-upstream-release.yml) 于 run [${GITHUB_RUN_ID}](https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) 自动生成。跟进完成后请手动关闭本 Issue。</sub>"
+          } > "$report"
+
+          echo "report_path=${report}" >> "$GITHUB_OUTPUT"
+          cat "$report" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create or update tracking issue
+        if: steps.tags.outputs.newer == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ steps.tags.outputs.target }}
+          REPORT: ${{ steps.dryrun.outputs.report_path }}
+        run: |
+          set -euo pipefail
+
+          # GitHub 对 fork **默认关闭 Issues**，此时 gh 只会报一句含糊的 404。
+          # 这个工作流唯一的通知手段就是 Issue，所以关掉等于失效，必须显式失败并说清楚。
+          if [[ "$(gh repo view "$GITHUB_REPOSITORY" --json hasIssuesEnabled --jq .hasIssuesEnabled)" != "true" ]]; then
+            echo "::error::Issues are disabled on ${GITHUB_REPOSITORY}, so this workflow cannot report anything. GitHub disables Issues on forks by default — enable them under Settings → General → Features → Issues."
+            exit 1
+          fi
+
+          # 以"跟进上游 <tag>"为唯一键：同一个上游版本只保留一个 Issue，每天重跑时
+          # 原地更新正文而不是新建，避免刷屏。跟进完成后人工关闭，下一个版本会另开。
+          title="跟进上游 ${TARGET}"
+
+          number="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
+            --json number,title --jq ".[] | select(.title == \"${title}\") | .number" | head -1)"
+
+          if [[ -n "$number" ]]; then
+            echo "Updating existing issue #${number}"
+            gh issue edit "$number" --repo "$GITHUB_REPOSITORY" --body-file "$REPORT"
+          else
+            echo "Creating issue: ${title}"
+            gh issue create --repo "$GITHUB_REPOSITORY" \
+              --title "$title" --body-file "$REPORT"
+          fi
