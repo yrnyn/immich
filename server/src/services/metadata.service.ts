@@ -1016,14 +1016,23 @@ export class MetadataService extends BaseService {
     }
 
     let dateTimeOriginal = dateTime?.toDateTime();
+    const serverTimeZone = process.env.TZ || null;
 
-    // do not let JavaScript use local timezone
-    if (dateTimeOriginal && !dateTime?.hasZone) {
-      dateTimeOriginal = dateTimeOriginal.setZone('UTC', { keepLocalTime: true });
+    if (dateTimeOriginal) {
+      if (timeZone) {
+        // Use the timezone explicitly found in the file metadata.
+        dateTimeOriginal = dateTimeOriginal.setZone(timeZone);
+      } else if (!dateTime?.hasZone) {
+        // The file has a date/time but no timezone.
+        // Interpret the wall-clock time in the configured server timezone and
+        // expose that fallback so clients can reconstruct the same local time.
+        dateTimeOriginal = dateTimeOriginal.setZone(serverTimeZone ?? 'local', { keepLocalTime: true });
+        timeZone = serverTimeZone;
+      } else {
+        // The parsed date/time already has a zone, but no separate exifTags.zone was selected.
+        dateTimeOriginal = dateTimeOriginal.setZone('UTC');
+      }
     }
-
-    // align with whatever timeZone we chose
-    dateTimeOriginal = dateTimeOriginal?.setZone(timeZone ?? 'UTC');
 
     // store as "local time"
     let localDateTime = dateTimeOriginal?.setZone('UTC', { keepLocalTime: true });
@@ -1040,7 +1049,9 @@ export class MetadataService extends BaseService {
       this.logger.debug(
         `No exif date time found, falling back on ${earliestDate.toISO()}, earliest of file creation and modification for asset ${asset.id}: ${asset.originalPath}`,
       );
-      dateTimeOriginal = localDateTime = earliestDate;
+      dateTimeOriginal = earliestDate;
+      localDateTime = earliestDate.setZone('UTC', { keepLocalTime: true });
+      timeZone ??= serverTimeZone;
     }
 
     this.logger.verbose(`Found local date time ${localDateTime.toISO()} for asset ${asset.id}: ${asset.originalPath}`);
