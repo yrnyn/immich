@@ -1,0 +1,325 @@
+name: Build custom Immich server
+
+# 推送 vX.Y.Z-tz-null-fix tag 会依次完成：构建镜像 → 发布该版本 Release 及部署附件 →
+# 把浮动的 v3 部署 tag 指向本次构建。浮动 tag 最后才移动，前面任一步失败都不会影响
+# 已部署环境。手动 dispatch 只构建不可变测试镜像，不会发布 Release，也不会移动 v3。
+
+on:
+  push:
+    tags:
+      - 'v*-tz-null-fix'
+  workflow_dispatch:
+    inputs:
+      build_label:
+        description: '构建标签，如 hotfix1（留空则只用 commit sha 标识）'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+# 串行发布，避免旧任务晚完成后覆盖新版本的 v3 tag。
+concurrency:
+  group: custom-server-release
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/yrnyn/immich-server
+  OFFICIAL_IMAGE_NAME: ghcr.io/immich-app/immich-server
+  OFFICIAL_COMPOSE: docker/docker-compose.yml
+  CUSTOM_COMPOSE: docker/docker-compose.custom.yml
+  ENV_TEMPLATE: docker/example.env
+
+jobs:
+  build:
+    name: Build and push image
+    runs-on: ubuntu-latest
+
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      release_tag: ${{ steps.release.outputs.release_tag }}
+      major_tag: ${{ steps.release.outputs.major_tag }}
+      immutable_tag: ${{ steps.release.outputs.immutable_tag }}
+      upstream_version: ${{ steps.release.outputs.upstream_version }}
+      is_release: ${{ steps.release.outputs.is_release }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+
+      - name: Resolve image metadata
+        id: release
+        shell: bash
+        env:
+          BUILD_LABEL: ${{ inputs.build_label }}
+        run: |
+          set -euo pipefail
+
+          source_version="$(node -p "require('./server/package.json').version")"
+          release_tag="v${source_version}-tz-null-fix"
+
+          if [[ ! "$release_tag" =~ ^(v[0-9]+)\.[0-9]+\.[0-9]+-tz-null-fix$ ]]; then
+            echo "::error::Unable to derive image tags from server version ${source_version}."
+            exit 1
+          fi
+
+          major_tag="${BASH_REMATCH[1]}"
+          immutable_tag="${release_tag}-${GITHUB_SHA}"
+          image_tags=("${IMAGE_NAME}:${immutable_tag}")
+          primary_tag="$immutable_tag"
+          source_ref="$GITHUB_REF_NAME"
+          is_release=false
+
+          case "$GITHUB_EVENT_NAME" in
+            push)
+              if [[ "$GITHUB_REF_TYPE" != "tag" || "$GITHUB_REF_NAME" != "$release_tag" ]]; then
+                echo "::error::Release tag must be ${release_tag}, received ${GITHUB_REF_NAME}."
+                exit 1
+              fi
+
+              # 只推不可变 tag；浮动的 major tag 由 promote job 在发布成功后再移动。
+              image_tags=(
+                "${IMAGE_NAME}:${release_tag}"
+                "${IMAGE_NAME}:${immutable_tag}"
+              )
+              primary_tag="$release_tag"
+              is_release=true
+              ;;
+            workflow_dispatch)
+              if [[ "$GITHUB_REF_TYPE" != "branch" ]]; then
+                echo "::error::Manual builds must run from a branch, received ${GITHUB_REF_TYPE} ${GITHUB_REF_NAME}."
+                exit 1
+              fi
+
+              if [[ -n "$BUILD_LABEL" ]]; then
+                if [[ ! "$BUILD_LABEL" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+                  echo "::error::Build label must match [A-Za-z0-9][A-Za-z0-9._-]*, received ${BUILD_LABEL}."
+                  exit 1
+                fi
+
+                labeled_tag="${release_tag}-${BUILD_LABEL}"
+                image_tags+=("${IMAGE_NAME}:${labeled_tag}")
+                primary_tag="$labeled_tag"
+                source_ref="$labeled_tag"
+              fi
+              ;;
+            *)
+              echo "::error::Unsupported event: ${GITHUB_EVENT_NAME}."
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "image_tags<<EOF"
+            printf '%s\n' "${image_tags[@]}"
+            echo "EOF"
+            echo "primary_tag=${primary_tag}"
+            echo "source_ref=${source_ref}"
+            echo "release_tag=${release_tag}"
+            echo "major_tag=${major_tag}"
+            echo "immutable_tag=${immutable_tag}"
+            echo "upstream_version=${source_version}"
+            echo "is_release=${is_release}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push custom immich-server
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: server/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.release.outputs.image_tags }}
+          build-args: |
+            BUILD_ID=${{ github.run_id }}
+            BUILD_IMAGE=${{ env.IMAGE_NAME }}:${{ steps.release.outputs.primary_tag }}
+            BUILD_SOURCE_REF=${{ steps.release.outputs.source_ref }}
+            BUILD_SOURCE_COMMIT=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release:
+    name: Publish release assets
+    needs: build
+    if: needs.build.outputs.is_release == 'true'
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@v6
+
+      # 定制 Compose 相对官方只允许差 immich-server 镜像仓库一行。发布前硬性校验，
+      # 避免 rebase 后忘记同步就把过期的部署文件发出去。
+      - name: Verify custom compose is in sync
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          matches="$(grep -c "^[[:space:]]*image:[[:space:]]*${OFFICIAL_IMAGE_NAME}:" "$OFFICIAL_COMPOSE" || true)"
+          if [[ "$matches" -ne 1 ]]; then
+            echo "::error::Expected exactly 1 immich-server image line in ${OFFICIAL_COMPOSE}, found ${matches}. Upstream changed the compose structure; update the sync rule."
+            exit 1
+          fi
+
+          sed "s|^\([[:space:]]*image:[[:space:]]*\)${OFFICIAL_IMAGE_NAME}:|\1${IMAGE_NAME}:|" \
+            "$OFFICIAL_COMPOSE" > /tmp/expected-compose.yml
+
+          # --strip-trailing-cr：定制文件可能是在 Windows 上生成的，比对不应受换行符影响。
+          if ! diff -u --strip-trailing-cr "$CUSTOM_COMPOSE" /tmp/expected-compose.yml; then
+            echo "::error::${CUSTOM_COMPOSE} is out of sync with ${OFFICIAL_COMPOSE}. Run misc/upgrade-custom-branch.ps1 to regenerate it."
+            exit 1
+          fi
+
+          echo "Custom compose differs from upstream by the immich-server image line only."
+
+      - name: Prepare release assets
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.build.outputs.release_tag }}
+          MAJOR_TAG: ${{ needs.build.outputs.major_tag }}
+          IMMUTABLE_TAG: ${{ needs.build.outputs.immutable_tag }}
+          UPSTREAM_VERSION: ${{ needs.build.outputs.upstream_version }}
+          IMAGE_DIGEST: ${{ needs.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          rm -rf release-assets
+          mkdir -p release-assets
+
+          # 上传时使用官方文件名，服务器端的固定下载地址才能直接覆盖同名文件。
+          cp "$CUSTOM_COMPOSE" release-assets/docker-compose.yml
+          cp "$ENV_TEMPLATE" release-assets/example.env
+
+          cat > release-assets/RELEASE_NOTES.md <<EOF
+          基于上游 Immich v${UPSTREAM_VERSION} 的时区修复定制版本。
+
+          ## 部署镜像
+
+          | 用途 | 值 |
+          | --- | --- |
+          | 部署浮动 tag | \`${IMAGE_NAME}:${MAJOR_TAG}\` |
+          | 版本 tag | \`${IMAGE_NAME}:${RELEASE_TAG}\` |
+          | 不可变 tag | \`${IMAGE_NAME}:${IMMUTABLE_TAG}\` |
+          | digest | \`${IMAGE_DIGEST}\` |
+
+          \`${MAJOR_TAG}\` 是浮动 tag，本 Release 记录的 digest 才是本次构建的实际镜像。
+
+          ## 升级
+
+          用本 Release 的 \`docker-compose.yml\` 整份覆盖服务器上的同名文件，本机定制保留在
+          \`.env\` 和 \`docker-compose.override.yml\` 中，两者都不会被覆盖：
+
+          \`\`\`bash
+          curl -fsSL -o docker-compose.yml https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/docker-compose.yml
+          docker compose pull && docker compose up -d
+          \`\`\`
+
+          附件 \`docker-compose.yml\` 与上游 v${UPSTREAM_VERSION} 的官方文件仅有 immich-server
+          镜像仓库一行不同。\`example.env\` 是上游模板，仅供首次部署，不要覆盖已有的 \`.env\`。
+          EOF
+
+          echo "Prepared release files:"
+          ls -lh release-assets
+          echo
+          cat release-assets/RELEASE_NOTES.md
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.build.outputs.release_tag }}
+          UPSTREAM_VERSION: ${{ needs.build.outputs.upstream_version }}
+        run: |
+          set -euo pipefail
+
+          release_title="Immich v${UPSTREAM_VERSION} (tz-null-fix)"
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release exists; updating in place: $RELEASE_TAG"
+
+            gh release edit "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$release_title" \
+              --notes-file release-assets/RELEASE_NOTES.md \
+              --latest
+
+            gh release upload "$RELEASE_TAG" \
+              release-assets/docker-compose.yml \
+              release-assets/example.env \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            echo "Creating release: $RELEASE_TAG"
+
+            gh release create "$RELEASE_TAG" \
+              release-assets/docker-compose.yml \
+              release-assets/example.env \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$release_title" \
+              --notes-file release-assets/RELEASE_NOTES.md \
+              --latest
+          fi
+
+      - name: Show download URLs
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.build.outputs.release_tag }}
+        run: |
+          echo "Stable deployment URLs (always the newest release):"
+          echo "  https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/docker-compose.yml"
+          echo "  https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/example.env"
+          echo
+          echo "Version-specific URLs:"
+          echo "  https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/docker-compose.yml"
+          echo "  https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/example.env"
+
+  promote:
+    name: Promote deployment tag
+    needs: [build, release]
+    if: needs.build.outputs.is_release == 'true'
+    runs-on: ubuntu-latest
+
+    permissions:
+      packages: write
+
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Point deployment tag at this build
+        shell: bash
+        env:
+          MAJOR_TAG: ${{ needs.build.outputs.major_tag }}
+          IMAGE_DIGEST: ${{ needs.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          # 基于已有 manifest 追加 tag，不重新构建。
+          docker buildx imagetools create \
+            --tag "${IMAGE_NAME}:${MAJOR_TAG}" \
+            "${IMAGE_NAME}@${IMAGE_DIGEST}"
+
+          echo "Deployment tag ${IMAGE_NAME}:${MAJOR_TAG} now points at ${IMAGE_DIGEST}."
