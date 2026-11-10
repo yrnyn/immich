@@ -1,0 +1,45 @@
+# docker-compose.override.yml 模板
+#
+# 用法：放在 docker-compose.yml 同目录即可，Compose 会自动加载它。Release 附件已按
+#       docker-compose.override.yml 这个名字提供，直接下载到部署目录即可，按需取消注释。
+#
+# 合并规则：volumes / ports 等列表与主文件追加合并；image、command 等标量直接替换；
+#           environment 等映射按键合并，同名键覆盖主文件。
+#
+# 升级时只需整份覆盖 docker-compose.yml，本文件保持不动，也不要重新下载它。
+# 修改后可用 `docker compose config` 检查合并结果。
+#
+# 注意：本文件默认不启用任何配置（服务占位为空），原样使用不会挂载任何目录、也不会替换镜像，
+#       至少取消注释一项才会生效。从旧部署复制 override 时，先删掉其中的 image: 行
+#       或改成定制镜像 tag，否则会覆盖本定制的 immich-server 镜像。
+
+services:
+  immich-server:
+    # 固定或回退镜像。只在需要钉住某次构建、或临时回退版本时取消注释。
+    # 不要改 .env 里的 IMMICH_VERSION：它同时决定官方 ML 镜像的 tag，
+    # 填入 vX.Y.Z-tz-null-fix 会让 ML 拉取一个不存在的 tag。
+    # image: ghcr.io/yrnyn/immich-server:v3.0.2-tz-null-fix
+
+    # 追加只读挂载：例如把宿主机上已有的照片目录给外部图库使用。
+    # 列表与主文件追加合并，不会替换原有的 /data 和 /etc/localtime 挂载。
+    # volumes:
+    #   - /mnt/photos:/mnt/photos:ro
+
+    # 追加端口映射（在保留 2283 之外再暴露一个端口）。
+    # ports:
+    #   - '2284:2283'
+
+    # 追加环境变量；同名键覆盖 .env 中的值。
+    # 时区修复依赖容器时区，通常也可以在 .env 里设置 TZ。
+    # environment:
+    #   TZ: Asia/Tokyo
+
+  immich-machine-learning:
+    # 例：调整模型缓存有效期（秒）。
+    # environment:
+    #   MACHINE_LEARNING_MODEL_TTL: '600'
+
+  database:
+    # 例：数据库所在磁盘不是 SSD 时启用 HDD 模式。
+    # environment:
+    #   DB_STORAGE_TYPE: 'HDD'

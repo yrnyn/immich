@@ -156,12 +156,13 @@ git push origin v3.0.3-tz-null-fix
 
 ## GitHub Release 与部署附件
 
-推送发布 tag 后，工作流会为该版本创建 GitHub Release 并上传两个附件，同时把它标记为 Latest。
+推送发布 tag 后，工作流会为该版本创建 GitHub Release 并上传三个附件，同时把它标记为 Latest。
 服务器端使用固定下载地址，始终指向最新一次成功发布：
 
 ```text
 https://github.com/yrnyn/immich/releases/latest/download/docker-compose.yml
 https://github.com/yrnyn/immich/releases/latest/download/example.env
+https://github.com/yrnyn/immich/releases/latest/download/docker-compose.override.yml
 ```
 
 每个版本也有各自的下载地址，用于回溯或回退：
@@ -170,12 +171,16 @@ https://github.com/yrnyn/immich/releases/latest/download/example.env
 https://github.com/yrnyn/immich/releases/download/v3.0.3-tz-null-fix/docker-compose.yml
 ```
 
-附件来源如下，上传时改用官方文件名，服务器才能直接覆盖同名文件：
+附件来源如下，上传时改用服务器端的文件名，下载即可直接使用：
 
 | 仓库文件 | Release 附件名 | 说明 |
 | --- | --- | --- |
 | `docker/docker-compose.custom.yml` | `docker-compose.yml` | 相对官方只差 immich-server 镜像仓库一行 |
 | `docker/example.env` | `example.env` | 上游模板，仅供首次部署；不要覆盖服务器已有的 `.env` |
+| `docker/docker-compose.override.example.yml` | `docker-compose.override.yml` | 注释模板；默认不产生任何改动，外部图库等定制写在这里 |
+
+override 附件默认不启用任何配置，下载后原样使用也不会有任何副作用，Compose 只是自动加载了一个空 override。
+只有用外部图库或需要固定镜像时才需要取消其中的注释；升级时不要重新下载它，否则会覆盖改过的路径。
 
 不再单独维护定制版 env 模板。上游的 `docker/example.env` 已经是 `IMMICH_VERSION=v3`，与本仓库 build 工作流
 从 `server/package.json` 推导出的 major tag 自动一致，因此直接发布上游文件即可。
@@ -205,7 +210,7 @@ Compose 的改动带进来。因此规定：**两者只允许差 immich-server �
 | --- | --- | --- |
 | `docker-compose.yml` | Release 附件 | 整份覆盖，不手工编辑 |
 | `.env` | 首次部署时从 `example.env` 复制 | 不动 |
-| `docker-compose.override.yml` | 自己维护 | 不动 |
+| `docker-compose.override.yml` | Release 附件模板，下载后按需修改 | 不动（不要重新下载） |
 
 本机定制全部放在 `.env` 和 `docker-compose.override.yml` 里。Compose 会自动加载 override 文件，其中的
 `volumes` 等列表与主文件**追加**合并，标量（如 `image`）则直接替换。
@@ -231,6 +236,51 @@ services:
   immich-server:
     image: ghcr.io/yrnyn/immich-server:v3.0.2-tz-null-fix
 ```
+
+## 全新部署
+
+首次部署同样只使用 Release 附件。**不要照上游官方文档从 `immich-app/immich` 下载**，那会装成官方镜像，
+本定制的时区修复不会生效：
+
+```bash
+mkdir -p ./immich-app && cd ./immich-app
+curl -fsSLO https://github.com/yrnyn/immich/releases/latest/download/docker-compose.yml
+curl -fsSL -o .env https://github.com/yrnyn/immich/releases/latest/download/example.env
+curl -fsSLO https://github.com/yrnyn/immich/releases/latest/download/docker-compose.override.yml
+```
+
+编辑 `.env`：
+
+- `UPLOAD_LOCATION` 指向图库存储目录；
+- `DB_DATA_LOCATION` 指向数据库目录（不支持网络共享）；
+- `DB_PASSWORD` 改成随机密码，只用字母和数字；
+- 取消 `TZ=` 一行的注释并填入时区，例如 `Asia/Tokyo`。时区补丁按容器时区解释无时区日期，
+  不设置会退回 UTC。
+
+用外部图库时，必须在首次启动前把图库目录挂进容器，且**容器内外路径要一致**——扫描发生在容器内，
+只挂到宿主机或在 UI 里填宿主机路径都不行。取消附件中挂载行的注释并改成实际目录：
+
+```yaml
+services:
+  immich-server:
+    volumes:
+      - /mnt/photos:/mnt/photos:ro
+```
+
+需要让 Immich 删除文件或写 XMP sidecar 时去掉 `:ro`。固定/回退镜像等其他定制同样写在这个文件里；
+从旧部署复制 override 时，先删掉其中的 `image:` 行（或改成定制镜像 tag），否则它会覆盖本定制的
+immich-server 镜像。
+
+然后启动并访问 `http://<服务器 IP>:2283` 注册管理员，其余初始化步骤见上游的
+[Post Installation](https://docs.immich.app/install/post-install)：
+
+```bash
+docker compose up -d
+```
+
+外部图库在 Administration → External Libraries 中建库，扫描路径填容器内路径（如 `/mnt/photos`）。
+`docker-compose.override.yml` 只在服务器上维护，不进 Git；以后升级只覆盖 `docker-compose.yml`，
+该文件不会被覆盖。
 
 ## 升级后检查
 
