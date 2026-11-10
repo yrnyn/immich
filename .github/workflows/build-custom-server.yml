@@ -31,6 +31,7 @@ env:
   OFFICIAL_COMPOSE: docker/docker-compose.yml
   CUSTOM_COMPOSE: docker/docker-compose.custom.yml
   ENV_TEMPLATE: docker/example.env
+  OVERRIDE_TEMPLATE: docker/docker-compose.override.example.yml
 
 jobs:
   build:
@@ -205,6 +206,7 @@ jobs:
           # 上传时使用官方文件名，服务器端的固定下载地址才能直接覆盖同名文件。
           cp "$CUSTOM_COMPOSE" release-assets/docker-compose.yml
           cp "$ENV_TEMPLATE" release-assets/example.env
+          cp "$OVERRIDE_TEMPLATE" release-assets/docker-compose.override.yml
 
           cat > release-assets/RELEASE_NOTES.md <<EOF
           基于上游 Immich v${UPSTREAM_VERSION} 的时区修复定制版本。
@@ -219,6 +221,46 @@ jobs:
           | digest | \`${IMAGE_DIGEST}\` |
 
           \`${MAJOR_TAG}\` 是浮动 tag，本 Release 记录的 digest 才是本次构建的实际镜像。
+
+          ## 全新部署
+
+          首次安装使用本 Release 的三个附件。不要用上游 \`immich-app/immich\` 的下载地址，
+          那会装成官方镜像，本版本的时区修复不会生效。
+
+          \`\`\`bash
+          mkdir -p ./immich-app && cd ./immich-app
+          curl -fsSLO https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/docker-compose.yml
+          curl -fsSL -o .env https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/example.env
+          curl -fsSLO https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/docker-compose.override.yml
+          \`\`\`
+
+          编辑 \`.env\`：至少设置 \`UPLOAD_LOCATION\`、\`DB_DATA_LOCATION\` 和 \`DB_PASSWORD\`，并取消
+          \`TZ=\` 一行的注释。本定制的时区修复依赖容器时区，不设置 \`TZ\` 会退回 UTC。
+
+          \`docker-compose.override.yml\` 默认不启用任何配置，原样使用不会有任何改动。用外部图库时，
+          取消其中挂载行的注释并换成实际目录；容器内外路径必须一致（扫描发生在容器内）：
+
+          \`\`\`yaml
+          services:
+            immich-server:
+              volumes:
+                - /mnt/photos:/mnt/photos:ro
+          \`\`\`
+
+          需要让 Immich 删除文件或写 XMP sidecar 时去掉 \`:ro\`。固定/回退镜像等其他定制同样写在
+          这个文件里；从旧部署复制 override 时，先删掉其中的 \`image:\` 行（或改成定制镜像），
+          否则会覆盖本定制的 immich-server 镜像。
+
+          然后启动：
+
+          \`\`\`bash
+          docker compose up -d
+          \`\`\`
+
+          访问 \`http://<服务器 IP>:2283\` 注册管理员；外部图库在 Administration → External Libraries
+          中建库，路径填容器内路径（如 \`/mnt/photos\`）。
+
+          升级只覆盖 \`docker-compose.yml\`，不要重新下载 override，否则会覆盖你改过的路径。
 
           ## 升级
 
@@ -262,6 +304,7 @@ jobs:
             gh release upload "$RELEASE_TAG" \
               release-assets/docker-compose.yml \
               release-assets/example.env \
+              release-assets/docker-compose.override.yml \
               --repo "$GITHUB_REPOSITORY" \
               --clobber
           else
@@ -270,6 +313,7 @@ jobs:
             gh release create "$RELEASE_TAG" \
               release-assets/docker-compose.yml \
               release-assets/example.env \
+              release-assets/docker-compose.override.yml \
               --repo "$GITHUB_REPOSITORY" \
               --title "$release_title" \
               --notes-file release-assets/RELEASE_NOTES.md \
@@ -284,10 +328,12 @@ jobs:
           echo "Stable deployment URLs (always the newest release):"
           echo "  https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/docker-compose.yml"
           echo "  https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/example.env"
+          echo "  https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/docker-compose.override.yml"
           echo
           echo "Version-specific URLs:"
           echo "  https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/docker-compose.yml"
           echo "  https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/example.env"
+          echo "  https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/docker-compose.override.yml"
 
   promote:
     name: Promote deployment tag
